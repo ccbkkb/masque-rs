@@ -1,9 +1,7 @@
 [package]
 name = "masque-proxy"
 version = "0.1.0"
-edition = "2021"
-
-[dependencies]
+edition = "2021"[dependencies]
 # 数据操作与错误处理
 bytes = "1.5"
 thiserror = "1.0"
@@ -15,15 +13,14 @@ http = "1.1"
 
 # 日志
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features =["env-filter"] }
 
-# QUIC, HTTP/3 与 TLS 生态 (修正了上游 API 冲突)
-quinn = "=0.11.1"
-quinn-proto = "=0.11.1"
-rustls = { version = "0.23", features = ["ring"] }
+# QUIC, HTTP/3 与 TLS 生态 (拥抱最新版，彻底告别依赖冲突！)
+quinn = "0.11"
+rustls = { version = "0.23", features =["ring"] }
 rustls-pki-types = "1.4"
-h3 = "0.0.6"
-h3-quinn = "0.0.7"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 
 # 测试用证书生成
 rcgen = "0.13"
