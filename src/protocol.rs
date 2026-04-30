@@ -52,7 +52,11 @@ pub enum ProtocolError {
 
 // Safety cap: refuse Capsule payloads larger than 16 MiB by default.
 // Callers may override via `decode_capsule_with_limit`.
-pub const DEFAULT_MAX_CAPSULE_PAYLOAD: u64 = 16 * 1024 * 1024;
+// pub const DEFAULT_MAX_CAPSULE_PAYLOAD: u64 = 16 * 1024 * 1024;
+
+// 防止恶意客户端发送虚假超大 Capsule 导致服务器 OOM。
+// UDP 数据报的最大理论大小为 65535，我们拒绝任何大于此值的载荷。
+pub const DEFAULT_MAX_CAPSULE_PAYLOAD: u64 = 65535;
 
 // -----------------------------------------------------------------------------
 // §1  RFC 9000 §16 — Variable-Length Integer
