@@ -117,7 +117,10 @@ async fn handle_request(
 ) {
     let (req, mut stream) = match resolver.resolve_request().await {
         Ok(pair) => pair,
-        Err(_) => return,
+        Err(e) => {
+            error!("Request resolution failed: {e}");
+            return;
+        }
     };
 
     let req = inject_protocol_header(req);
@@ -142,6 +145,7 @@ async fn handle_request(
     {
         Some(a) => a,
         None => {
+            error!("DNS resolution failed for {target_host}:{target_port}");
             let _ = send_response(&mut stream, StatusCode::BAD_GATEWAY).await;
             return;
         }
@@ -149,19 +153,22 @@ async fn handle_request(
 
     let udp_sock = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
-        Err(_) => {
+        Err(e) => {
+            error!("UDP bind failed: {e}");
             let _ = send_response(&mut stream, StatusCode::INTERNAL_SERVER_ERROR).await;
             return;
         }
     };
 
-    if udp_sock.connect(target_addr).await.is_err() {
+    if let Err(e) = udp_sock.connect(target_addr).await {
+        error!("UDP connect failed: {e}");
         let _ = send_response(&mut stream, StatusCode::BAD_GATEWAY).await;
         return;
     }
 
     // 3. Send 200 OK + Capsule Protocol Header
-    if send_connect_udp_ok(&mut stream).await.is_err() {
+    if let Err(e) = send_connect_udp_ok(&mut stream).await {
+        debug!("Failed to send 200 OK: {e}");
         return;
     }
 
@@ -187,7 +194,6 @@ async fn handle_request(
         loop {
             match stream.recv_data().await {
                 Ok(Some(data)) => {
-                    // API 修复: data 是 h3::ext::Buf, 需要消费掉转为 Bytes
                     use bytes::Buf;
                     let mut data = data;
                     let chunk = data.copy_to_bytes(data.remaining());
@@ -246,7 +252,8 @@ async fn send_connect_udp_ok(stream: &mut H3Stream) -> anyhow::Result<()> {
 
 fn inject_protocol_header(mut req: Request<()>) -> Request<()> {
     if let Some(proto) = req.extensions().get::<h3::ext::Protocol>() {
-        if let Ok(val) = http::HeaderValue::from_str(proto.as_ref()) {
+        // Fix: h3 0.0.8 removed AsRef, but provides an explicit .as_str() method.
+        if let Ok(val) = http::HeaderValue::from_str(proto.as_str()) {
             req.headers_mut().insert("x-protocol", val);
         }
     }
