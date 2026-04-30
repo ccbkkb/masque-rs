@@ -1,7 +1,9 @@
 [package]
 name = "masque-proxy"
 version = "0.1.0"
-edition = "2021"[dependencies]
+edition = "2021"
+
+[dependencies]
 # 数据操作与错误处理
 bytes = "1.5"
 thiserror = "1.0"
