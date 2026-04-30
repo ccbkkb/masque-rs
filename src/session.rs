@@ -174,6 +174,18 @@ fn parse_masque_udp_path(path: &str) -> Result<(String, u16), SessionError> {
         return Err(SessionError::ParseError("port 0 is not valid".into()));
     }
 
+    // ==========================================
+    // UDP 反射放大攻击防御
+    // 拦截极其危险的公网 UDP 放大器端口，防止代理服务器沦为 DDoS 跳板
+    // 17(QOTD), 19(Chargen), 111(Portmap), 123(NTP), 520(RIP), 1900(SSDP), 11211(Memcached)
+    // ==========================================
+    const BLOCKED_PORTS: &[u16] = &[17, 19, 111, 123, 520, 1900, 11211];
+    if BLOCKED_PORTS.contains(&port) {
+        return Err(SessionError::ParseError(format!(
+            "target port {} is blacklisted for security (Amplification Risk)", port
+        )));
+    }
+    
     Ok((host, port))
 }
 
