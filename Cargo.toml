@@ -26,3 +26,5 @@ h3-quinn = "0.0.10"
 
 # 测试用证书生成
 rcgen = "0.13"
+
+clap = { version = "4", features = ["derive"] }
