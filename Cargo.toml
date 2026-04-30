@@ -28,3 +28,9 @@ h3-quinn = "0.0.10"
 rcgen = "0.13"
 
 clap = { version = "4", features = ["derive"] }
+
+# 引入高并发无锁哈希表（解决串线与路由）
+dashmap = "5.5"
+
+# 引入操作系统资源限制管理（解决 FD 耗尽）
+rlimit = "0.10"
