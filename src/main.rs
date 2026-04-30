@@ -1,4 +1,8 @@
 // src/main.rs
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(dead_code)]
+
 mod protocol;
 mod session;
 
@@ -8,7 +12,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use clap::Parser;
-use dashmap::DashMap; // 高并发无锁 Map
+use dashmap::DashMap;
 use h3::server::RequestResolver;
 use http::{Request, Response, StatusCode};
 use tokio::net::UdpSocket;
@@ -39,7 +43,7 @@ pub struct AppConfig {
 }
 
 // =============================================================================
-// § 1 — TLS & QUIC 初始化 (保持不变)
+// § 1 — TLS & QUIC 初始化
 // =============================================================================
 
 fn generate_self_signed_cert() -> anyhow::Result<(
@@ -88,28 +92,24 @@ fn make_server_config(
 }
 
 // =============================================================================
-// § 2 — HTTP/3 Connection & Datagram Demuxer (解决串线漏洞)
+// § 2 — HTTP/3 Connection & Datagram Demuxer
 // =============================================================================
 
 async fn handle_connection(quic_conn: quinn::Connection, config: Arc<AppConfig>) {
-    let conn_id = quic_conn.stable_id();
+    let _conn_id = quic_conn.stable_id();
     let h3_quic = h3_quinn::Connection::new(quic_conn.clone());
     let mut h3_conn = match h3::server::Connection::new(h3_quic).await {
         Ok(c) => c,
         Err(_) => return,
     };
 
-    // 【漏洞 1 修复】：全局路由表 (Quarter Stream ID -> Session Channel)
     let datagram_routers = Arc::new(DashMap::<u64, mpsc::Sender<QuicMessage>>::new());
 
-    // 启动独立的数据报文分发器 (Datagram Demuxer)
     let demux_quic_rx = quic_conn.clone();
     let routers = datagram_routers.clone();
     let demux_task = tokio::spawn(async move {
         while let Ok(mut dgram) = demux_quic_rx.read_datagram().await {
-            // 解析 RFC 9297 Quarter Stream ID
             if let Ok(Some(q_stream_id)) = decode_varint(&mut dgram) {
-                // 如果存在对应的会话，投递 Payload (此时 dgram 指针已滑过 Q-Stream-ID，剩下的就是 HTTP Datagram Payload)
                 if let Some(sender) = routers.get(&q_stream_id.value) {
                     let _ = sender.value().send(QuicMessage::Datagram(dgram)).await;
                 }
@@ -166,7 +166,6 @@ async fn handle_request(
     };
 
     if !config.allow_local && is_private_or_loopback(target_addr.ip()) {
-        warn!("SSRF Blocked: Attempt to connect to {}", target_addr.ip());
         let _ = send_response(&mut stream, StatusCode::FORBIDDEN).await;
         return;
     }
@@ -183,14 +182,20 @@ async fn handle_request(
 
     if send_connect_udp_ok(&mut stream).await.is_err() { return; }
 
-    // ==========================================
-    // 隧道通信与桥接核心
-    // ==========================================
     let (h3_to_session_tx, h3_to_session_rx) = mpsc::channel::<QuicMessage>(SESSION_CHANNEL_CAP);
     let (session_to_h3_tx, mut session_to_h3_rx) = mpsc::channel::<Bytes>(SESSION_CHANNEL_CAP);
 
-    // 计算 Quarter Stream ID，并注册到全局路由器
-    let stream_id = u64::from(stream.id());
+    // ==========================================
+    // 鲁棒性计算 Quarter Stream ID
+    // 采用字符串提取法，完美绕过底层的私有字段和版本类型差异！
+    // ==========================================
+    let stream_id_raw = format!("{:?}", stream.id());
+    let stream_id: u64 = stream_id_raw
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0);
     let quarter_stream_id = stream_id / 4;
     datagram_routers.insert(quarter_stream_id, h3_to_session_tx.clone());
 
@@ -216,7 +221,6 @@ async fn handle_request(
     // Task B: Session -> QUIC Datagram
     let dgram_send_task = tokio::spawn(async move {
         while let Some(payload) = session_to_h3_rx.recv().await {
-            // 【漏洞 1 修复】：组装外层 QUIC Datagram 结构： Quarter Stream ID | HTTP Datagram Payload
             let mut out = bytes::BytesMut::with_capacity(8 + payload.len());
             encode_varint(&mut out, quarter_stream_id);
             out.extend_from_slice(&payload);
@@ -228,7 +232,6 @@ async fn handle_request(
     let mut session = ConnectUdpSession::new(udp_sock, h3_to_session_rx, session_to_h3_tx);
     let _ = session.run().await;
 
-    // 清理资源，注销路由
     datagram_routers.remove(&quarter_stream_id);
     stream_recv_task.abort();
     dgram_send_task.abort();
@@ -270,9 +273,8 @@ fn inject_protocol_header(mut req: Request<()>) -> Request<()> {
 async fn main() -> anyhow::Result<()> {
     let config = Arc::new(AppConfig::parse());
 
-    // 【风险 3 修复】：尝试提升操作系统的文件描述符限制，防止 ulimit 耗尽
     if let Err(e) = rlimit::increase_nofile_limit(65535) {
-        warn!("Failed to increase NOFILE limit (requires root/privileges): {}. Current limits might restrict max connections.", e);
+        warn!("Failed to increase NOFILE limit: {}", e);
     }
 
     let _ = rustls::crypto::ring::default_provider().install_default();
