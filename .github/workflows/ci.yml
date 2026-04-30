@@ -1,0 +1,53 @@
+name: MASQUE Core CI (Manual)
+
+# 仅允许在 GitHub Actions 页面手动点击 "Run workflow" 触发
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_and_test:
+    name: Build, Test & Run
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🦀 Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 📦 Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: 🧪 Run Unit Tests (The 42 Green Tests)
+        run: cargo test --verbose
+
+      - name: 🔨 Build Release Binary
+        run: cargo build --release
+
+      - name: 🚀 Integration Test (Boot Server & Verify Port)
+        run: |
+          echo "Starting MASQUE Proxy Server..."
+          # 在后台启动服务器，开启日志便于查错
+          RUST_LOG=info,masque_proxy=debug ./target/release/masque-proxy &
+          SERVER_PID=$!
+          
+          # 等待 3 秒，让 rcgen 生成证书，quinn 绑定 UDP 端口
+          sleep 3
+          
+          # 检查 4433 端口的 UDP 监听状态
+          if ss -uln | grep -q ":4433"; then
+            echo "================================================="
+            echo "✅ SUCCESS: MASQUE Proxy is running and listening on 0.0.0.0:4433!"
+            echo "================================================="
+          else
+            echo "❌ ERROR: Server failed to bind to port 4433."
+            kill $SERVER_PID
+            exit 1
+          fi
+          
+          # 验证完毕，优雅关闭进程
+          kill $SERVER_PID
