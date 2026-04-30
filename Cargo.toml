@@ -1,0 +1,28 @@
+[package]
+name = "masque-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 数据操作与错误处理
+bytes = "1.5"
+thiserror = "1.0"
+anyhow = "1.0"
+
+# 异步运行时与 HTTP
+tokio = { version = "1", features = ["full"] }
+http = "1.1"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# QUIC, HTTP/3 与 TLS 生态
+quinn = "0.11"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1.4"
+h3 = "0.0.6"
+h3-quinn = "0.0.7"
+
+# 测试用证书生成
+rcgen = "0.13"
