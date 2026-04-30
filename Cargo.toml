@@ -1,36 +1,26 @@
-[package]
 name = "masque-proxy"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# 数据操作与错误处理
 bytes = "1.5"
 thiserror = "1.0"
 anyhow = "1.0"
-
-# 异步运行时与 HTTP
 tokio = { version = "1", features = ["full"] }
 http = "1.1"
-
-# 日志
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features =["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+dashmap = "5.5"
+rlimit = "0.10"
 
-# QUIC, HTTP/3 与 TLS 生态 (拥抱最新版，彻底告别依赖冲突！)
+# QUIC, HTTP/3 与 TLS 生态
 quinn = "0.11"
-rustls = { version = "0.23", features =["ring"] }
+rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = "1.4"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 
-# 测试用证书生成
+# 证书加载与生成
 rcgen = "0.13"
-
-clap = { version = "4", features = ["derive"] }
-
-# 引入高并发无锁哈希表（解决串线与路由）
-dashmap = "5.5"
-
-# 引入操作系统资源限制管理（解决 FD 耗尽）
-rlimit = "0.10"
+rustls-pemfile = "2.1" # 从磁盘读取证书
