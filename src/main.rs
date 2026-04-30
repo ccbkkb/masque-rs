@@ -1,21 +1,22 @@
 // src/main.rs
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(dead_code)]
+#![allow(unused_imports, unused_variables, dead_code)]
 
 mod protocol;
 mod session;
 
+use std::fs::File;
+use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use clap::Parser;
 use dashmap::DashMap;
 use h3::server::RequestResolver;
-use http::{Request, Response, StatusCode};
-use tokio::net::UdpSocket;
+use http::{Method, Request, Response, StatusCode};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -30,7 +31,7 @@ const DATAGRAM_RECV_WINDOW: u64 = 16 * 1024 * 1024;
 // =============================================================================
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "MASQUE (CONNECT-UDP) Zero-Trust Proxy")]
+#[command(author, version, about = "MASQUE (TCP + UDP) Zero-Trust Proxy")]
 pub struct AppConfig {
     #[arg(short, long, default_value = "0.0.0.0:4433")]
     pub listen: SocketAddr,
@@ -40,11 +41,34 @@ pub struct AppConfig {
     pub allow_local: bool,
     #[arg(long, default_value_t = 10000)]
     pub max_sessions: usize,
+    
+    // 【新增】支持传入真实证书
+    /// 证书公钥文件路径 (如 fullchain.pem)
+    #[arg(long)]
+    pub cert: Option<String>,
+    /// 证书私钥文件路径 (如 privkey.pem)
+    #[arg(long)]
+    pub key: Option<String>,
 }
 
 // =============================================================================
-// § 1 — TLS & QUIC 初始化
+// § 1 — TLS & QUIC 初始化 (加入证书读取逻辑)
 // =============================================================================
+
+fn load_certs_from_file(cert_path: &str, key_path: &str) -> anyhow::Result<(
+    rustls_pki_types::CertificateDer<'static>,
+    rustls_pki_types::PrivateKeyDer<'static>,
+)> {
+    let mut cert_reader = BufReader::new(File::open(cert_path)?);
+    let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    let cert = certs.into_iter().next().ok_or_else(|| anyhow::anyhow!("No cert found in file"))?;
+
+    let mut key_reader = BufReader::new(File::open(key_path)?);
+    let key = rustls_pemfile::private_key(&mut key_reader)?
+        .ok_or_else(|| anyhow::anyhow!("No private key found in file"))?;
+
+    Ok((cert, key))
+}
 
 fn generate_self_signed_cert() -> anyhow::Result<(
     rustls_pki_types::CertificateDer<'static>,
@@ -57,7 +81,6 @@ fn generate_self_signed_cert() -> anyhow::Result<(
     params.subject_alt_names = vec![
         SanType::DnsName("localhost".try_into()?),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-        SanType::IpAddress(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
     ];
     let key_pair = KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
@@ -92,11 +115,10 @@ fn make_server_config(
 }
 
 // =============================================================================
-// § 2 — HTTP/3 Connection & Datagram Demuxer
+// § 2 — HTTP/3 Connection & Router
 // =============================================================================
 
 async fn handle_connection(quic_conn: quinn::Connection, config: Arc<AppConfig>) {
-    let _conn_id = quic_conn.stable_id();
     let h3_quic = h3_quinn::Connection::new(quic_conn.clone());
     let mut h3_conn = match h3::server::Connection::new(h3_quic).await {
         Ok(c) => c,
@@ -105,6 +127,7 @@ async fn handle_connection(quic_conn: quinn::Connection, config: Arc<AppConfig>)
 
     let datagram_routers = Arc::new(DashMap::<u64, mpsc::Sender<QuicMessage>>::new());
 
+    // UDP Datagram 分发器
     let demux_quic_rx = quic_conn.clone();
     let routers = datagram_routers.clone();
     let demux_task = tokio::spawn(async move {
@@ -140,12 +163,121 @@ async fn handle_request(
     config: Arc<AppConfig>,
     datagram_routers: Arc<DashMap<u64, mpsc::Sender<QuicMessage>>>,
 ) {
-    let (req, mut stream) = match resolver.resolve_request().await {
+    let (mut req, mut stream) = match resolver.resolve_request().await {
         Ok(pair) => pair,
         Err(_) => return,
     };
-    let req = inject_protocol_header(req);
 
+    if req.method() != Method::CONNECT {
+        let _ = send_response(&mut stream, StatusCode::METHOD_NOT_ALLOWED).await;
+        return;
+    }
+
+    // 提取协议头
+    let protocol = req.extensions().get::<h3::ext::Protocol>().map(|p| p.as_str().to_string());
+    if let Some(ref p) = protocol {
+        if let Ok(val) = http::HeaderValue::from_str(p) {
+            req.headers_mut().insert("x-protocol", val);
+        }
+    }
+
+    // 【核心路由】：识别是 TCP 还是 UDP
+    if protocol.as_deref() == Some("connect-udp") {
+        handle_udp_tunnel(req, stream, quic_conn, config, datagram_routers).await;
+    } else {
+        // 没有 protocol，默认是标准的 TCP CONNECT 代理
+        handle_tcp_tunnel(req, stream, config).await;
+    }
+}
+
+// ── 通用安全组件：DNS 解析与 SSRF 防护 ──
+async fn resolve_and_check(target: &str, config: &AppConfig) -> Result<SocketAddr, StatusCode> {
+    let fut = tokio::net::lookup_host(target);
+    let addr = match tokio::time::timeout(Duration::from_secs(config.dns_timeout), fut).await {
+        Ok(Ok(mut it)) => {
+            if let Some(a) = it.next() { a } else { return Err(StatusCode::BAD_GATEWAY); }
+        }
+        _ => return Err(StatusCode::BAD_GATEWAY),
+    };
+    if !config.allow_local && is_private_or_loopback(addr.ip()) {
+        warn!("SSRF Blocked: Attempt to connect to {}", addr.ip());
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(addr)
+}
+
+// =============================================================================
+// § 3A — TCP 隧道代理 (标准的 HTTP CONNECT)
+// =============================================================================
+async fn handle_tcp_tunnel(
+    req: Request<()>,
+    mut stream: H3Stream,
+    config: Arc<AppConfig>,
+) {
+    let target_str = req.uri().authority().map(|a| a.as_str()).unwrap_or_else(|| req.uri().path());
+    
+    let target_addr = match resolve_and_check(target_str, &config).await {
+        Ok(addr) => addr,
+        Err(status) => {
+            let _ = send_response(&mut stream, status).await;
+            return;
+        }
+    };
+
+    let mut tcp_stream = match TcpStream::connect(target_addr).await {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = send_response(&mut stream, StatusCode::BAD_GATEWAY).await;
+            return;
+        }
+    };
+
+    info!("TCP Tunnel accepted to {}", target_str);
+    if send_response(&mut stream, StatusCode::OK).await.is_err() { return; }
+
+    // 【TCP 数据桥接】：在一个 select! 循环中无锁双向全双工拷贝
+    let mut buf = [0u8; 16384];
+    loop {
+        tokio::select! {
+            // H3 Stream -> TCP Socket (客户端发来的数据)
+            h3_data = stream.recv_data() => {
+                match h3_data {
+                    Ok(Some(mut data)) => {
+                        let chunk = data.copy_to_bytes(data.remaining());
+                        if tcp_stream.write_all(&chunk).await.is_err() { break; }
+                    }
+                    Ok(None) | Err(_) => break, // 客户端断开
+                }
+            }
+            // TCP Socket -> H3 Stream (目标网站返回的数据)
+            tcp_n = tcp_stream.read(&mut buf) => {
+                match tcp_n {
+                    Ok(0) => {
+                        // TCP EOF, 通知 H3 客户端结束
+                        let _ = stream.finish().await;
+                        break;
+                    }
+                    Ok(n) => {
+                        if stream.send_data(Bytes::copy_from_slice(&buf[..n])).await.is_err() { break; }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    debug!("TCP Tunnel to {} closed", target_str);
+}
+
+// =============================================================================
+// § 3B — UDP 隧道代理 (CONNECT-UDP) 保持不变
+// =============================================================================
+async fn handle_udp_tunnel(
+    req: Request<()>,
+    mut stream: H3Stream,
+    quic_conn: quinn::Connection,
+    config: Arc<AppConfig>,
+    datagram_routers: Arc<DashMap<u64, mpsc::Sender<QuicMessage>>>,
+) {
     let (target_host, target_port) = match session::parse_connect_udp_target(&req) {
         Ok(pair) => pair,
         Err(_) => {
@@ -154,59 +286,38 @@ async fn handle_request(
         }
     };
 
-    let resolve_future = tokio::net::lookup_host(format!("{target_host}:{target_port}"));
-    let target_addr: SocketAddr = match tokio::time::timeout(Duration::from_secs(config.dns_timeout), resolve_future).await {
-        Ok(Ok(mut it)) => {
-            if let Some(a) = it.next() { a } else { return; }
-        }
-        Ok(Err(_)) | Err(_) => {
-            let _ = send_response(&mut stream, StatusCode::BAD_GATEWAY).await;
+    let target_str = format!("{}:{}", target_host, target_port);
+    let target_addr = match resolve_and_check(&target_str, &config).await {
+        Ok(addr) => addr,
+        Err(status) => {
+            let _ = send_response(&mut stream, status).await;
             return;
         }
     };
 
-    if !config.allow_local && is_private_or_loopback(target_addr.ip()) {
-        let _ = send_response(&mut stream, StatusCode::FORBIDDEN).await;
-        return;
-    }
-
-    info!("Tunnel accepted to {}:{}", target_host, target_port);
+    info!("UDP Tunnel accepted to {}", target_str);
 
     let udp_sock = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
         Err(_) => return,
     };
-    if udp_sock.connect(target_addr).await.is_err() {
-        return;
-    }
+    if udp_sock.connect(target_addr).await.is_err() { return; }
 
     if send_connect_udp_ok(&mut stream).await.is_err() { return; }
 
     let (h3_to_session_tx, h3_to_session_rx) = mpsc::channel::<QuicMessage>(SESSION_CHANNEL_CAP);
     let (session_to_h3_tx, mut session_to_h3_rx) = mpsc::channel::<Bytes>(SESSION_CHANNEL_CAP);
 
-    // ==========================================
-    // 鲁棒性计算 Quarter Stream ID
-    // 采用字符串提取法，完美绕过底层的私有字段和版本类型差异！
-    // ==========================================
     let stream_id_raw = format!("{:?}", stream.id());
-    let stream_id: u64 = stream_id_raw
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .unwrap_or(0);
+    let stream_id: u64 = stream_id_raw.chars().filter(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0);
     let quarter_stream_id = stream_id / 4;
     datagram_routers.insert(quarter_stream_id, h3_to_session_tx.clone());
 
-    // Task A: H3 Stream (Capsules) -> Session
     let stream_tx = h3_to_session_tx;
     let stream_recv_task = tokio::spawn(async move {
         loop {
             match stream.recv_data().await {
-                Ok(Some(data)) => {
-                    use bytes::Buf;
-                    let mut data = data;
+                Ok(Some(mut data)) => {
                     let chunk = data.copy_to_bytes(data.remaining());
                     if stream_tx.send(QuicMessage::StreamChunk(chunk)).await.is_err() { break; }
                 }
@@ -218,13 +329,11 @@ async fn handle_request(
         }
     });
 
-    // Task B: Session -> QUIC Datagram
     let dgram_send_task = tokio::spawn(async move {
         while let Some(payload) = session_to_h3_rx.recv().await {
             let mut out = bytes::BytesMut::with_capacity(8 + payload.len());
             encode_varint(&mut out, quarter_stream_id);
             out.extend_from_slice(&payload);
-            
             if quic_conn.send_datagram(out.freeze()).is_err() { break; }
         }
     });
@@ -245,7 +354,7 @@ fn is_private_or_loopback(ip: IpAddr) -> bool {
 }
 
 // =============================================================================
-// § 3 & 4 — Helpers & Main
+// § 4 — Helpers & Main
 // =============================================================================
 
 type H3Stream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
@@ -260,15 +369,6 @@ async fn send_connect_udp_ok(stream: &mut H3Stream) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn inject_protocol_header(mut req: Request<()>) -> Request<()> {
-    if let Some(proto) = req.extensions().get::<h3::ext::Protocol>() {
-        if let Ok(val) = http::HeaderValue::from_str(proto.as_str()) {
-            req.headers_mut().insert("x-protocol", val);
-        }
-    }
-    req
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = Arc::new(AppConfig::parse());
@@ -280,28 +380,28 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt().with_env_filter("info,masque_proxy=debug").init();
 
-    let (cert_der, key_der) = generate_self_signed_cert()?;
-    info!("Generated self-signed TLS certificate");
+    // 【核心改进】：根据命令行参数智能加载证书
+    let (cert_der, key_der) = if let (Some(cert_path), Some(key_path)) = (&config.cert, &config.key) {
+        info!("Loading TLS certificates from {} and {}", cert_path, key_path);
+        load_certs_from_file(cert_path, key_path)?
+    } else {
+        info!("No cert provided, generating self-signed TLS certificate (For Testing)");
+        generate_self_signed_cert()?
+    };
 
     let server_cfg = make_server_config(cert_der, key_der)?;
     let endpoint = quinn::Endpoint::server(server_cfg, config.listen)?;
-    info!("MASQUE CONNECT-UDP zero-trust proxy listening on {}", config.listen);
+    info!("MASQUE (TCP+UDP) Zero-Trust Proxy listening on {}", config.listen);
 
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(config.max_sessions));
 
     while let Some(incoming) = endpoint.accept().await {
         let permit = connection_limit.clone().acquire_owned().await;
         let config_clone = config.clone();
-        
-        match incoming.await {
-            Ok(conn) => {
-                tokio::spawn(async move {
-                    let _permit = permit; 
-                    handle_connection(conn, config_clone).await;
-                });
-            }
-            Err(e) => warn!("Connection failed: {}", e),
-        }
+        tokio::spawn(async move {
+            let _permit = permit; 
+            handle_connection(incoming.await.unwrap(), config_clone).await;
+        });
     }
 
     Ok(())
